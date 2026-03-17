@@ -28,9 +28,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   const hasSupabase = CONFIG.SUPABASE_URL && !CONFIG.SUPABASE_URL.includes('YOUR_');
   if (hasSpotify && hasSupabase && banner) banner.style.display = 'none';
 
-  // Handle Spotify OAuth callback first
-  const urlParams = new URLSearchParams(window.location.search);
-  if (urlParams.get('code')) {
+  // Handle Spotify OAuth callback
+  if (window.location.search.includes('code=')) {
     await handleSpotifyCallback();
     return;
   }
@@ -75,10 +74,9 @@ async function loginWithSpotify() {
     return;
   }
 
-  const codeVerifier = generateCodeVerifier();
-  const codeChallenge = await generateCodeChallenge(codeVerifier);
-
-  localStorage.setItem('wavely_code_verifier', codeVerifier);
+  const verifier = generateVerifier();
+  const challenge = await generateChallenge(verifier);
+  sessionStorage.setItem('pkce_verifier', verifier);
 
   const params = new URLSearchParams({
     client_id: CONFIG.SPOTIFY_CLIENT_ID,
@@ -86,10 +84,22 @@ async function loginWithSpotify() {
     redirect_uri: CONFIG.SPOTIFY_REDIRECT_URI,
     scope: CONFIG.SPOTIFY_SCOPES,
     code_challenge_method: 'S256',
-    code_challenge: codeChallenge,
+    code_challenge: challenge,
   });
 
   window.location.href = `https://accounts.spotify.com/authorize?${params}`;
+}
+
+function generateVerifier() {
+  const arr = new Uint8Array(64);
+  crypto.getRandomValues(arr);
+  return btoa(String.fromCharCode(...arr)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+
+async function generateChallenge(verifier) {
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 }
 
 async function handleSpotifyCallback() {
@@ -97,11 +107,10 @@ async function handleSpotifyCallback() {
   const code = params.get('code');
   if (!code) { showAuthScreen(); return; }
 
-  // Clean URL immediately
   window.history.replaceState({}, '', '/');
 
-  const codeVerifier = localStorage.getItem('wavely_code_verifier');
-  if (!codeVerifier) return;
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  if (!verifier) { showToast('Login error. Try again.'); showAuthScreen(); return; }
 
   try {
     const res = await fetch('https://accounts.spotify.com/api/token', {
@@ -112,42 +121,32 @@ async function handleSpotifyCallback() {
         code,
         redirect_uri: CONFIG.SPOTIFY_REDIRECT_URI,
         client_id: CONFIG.SPOTIFY_CLIENT_ID,
-        code_verifier: codeVerifier,
+        code_verifier: verifier,
       }),
     });
 
     const data = await res.json();
+    console.log('Token response:', data);
 
     if (data.access_token) {
       spotifyToken = data.access_token;
       localStorage.setItem('wavely_token', spotifyToken);
       localStorage.setItem('wavely_token_expiry', Date.now() + data.expires_in * 1000);
-      localStorage.removeItem('wavely_code_verifier');
+      sessionStorage.removeItem('pkce_verifier');
       await initApp();
     } else {
-      showToast('Login failed. Please try again.');
+      console.error('Token error:', data);
+      showToast('Login failed: ' + (data.error_description || data.error));
       showAuthScreen();
     }
   } catch (e) {
     console.error('Token exchange failed:', e);
+    showToast('Login failed. Try again.');
     showAuthScreen();
   }
 }
 
-// PKCE helpers
-function generateCodeVerifier() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
-  const arr = new Uint8Array(64);
-  crypto.getRandomValues(arr);
-  return Array.from(arr).map(v => chars[v % chars.length]).join('');
-}
 
-async function generateCodeChallenge(verifier) {
-  const enc = new TextEncoder().encode(verifier);
-  const hash = await crypto.subtle.digest('SHA-256', enc);
-  return btoa(String.fromCharCode(...new Uint8Array(hash)))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
 
 function logout() {
   localStorage.removeItem('wavely_token');
