@@ -1,9 +1,13 @@
-const http = require('http');
+// =============================================
+//  WAVELY — HTTPS Local Server
+//  Run: node server.js
+// =============================================
+
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = 3000;
-const HOST = '127.0.0.1';
 
 const MIME = {
   '.html': 'text/html',
@@ -15,14 +19,14 @@ const MIME = {
   '.ico':  'image/x-icon',
 };
 
-const server = http.createServer((req, res) => {
-  const isCallback = req.url.startsWith('/callback');
-  const isRoot = req.url === '/';
+// mkcert certificates — already generated in your project folder
+const options = {
+  cert: fs.readFileSync(path.join(__dirname, 'localhost.pem')),
+  key:  fs.readFileSync(path.join(__dirname, 'localhost-key.pem')),
+};
 
-  let filePath = (isRoot || isCallback)
-    ? '/index.html'
-    : req.url.split('?')[0];
-
+const server = https.createServer(options, (req, res) => {
+  let filePath = req.url === '/' ? '/index.html' : req.url.split('?')[0];
   const fullPath = path.join(__dirname, filePath);
   const ext = path.extname(fullPath);
   const contentType = MIME[ext] || 'text/plain';
@@ -40,7 +44,7 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`\n🎵 Wavely is running!`);
-  console.log(`👉 Open: http://127.0.0.1:${PORT}\n`);
+server.listen(PORT, () => {
+  console.log('\n🎵 Wavely is running on HTTPS!');
+  console.log(`👉 Open: https://localhost:${PORT}\n`);
 });
