@@ -1,5 +1,5 @@
 // =============================================
-//  WAVELY — YouTube Edition
+//  SONICRA — YouTube Edition
 //  Full song playback via YouTube IFrame API
 // =============================================
 
@@ -21,8 +21,8 @@ let progressTimer = null;
 function onYouTubeIframeAPIReady() {
   console.log('✅ YouTube IFrame API Ready');
   ytPlayer = new YT.Player('yt-player', {
-    height: '124',
-    width: '220',
+    height: '1',
+    width: '1',
     playerVars: {
       autoplay: 1,
       controls: 1,
@@ -119,14 +119,14 @@ function initSupabase() {
 
 // ─── Theme ──────────────────────────────────────
 function initTheme() {
-  const saved = localStorage.getItem('wavely_theme') || 'dark';
+  const saved = localStorage.getItem('sonicra_theme') || 'dark';
   document.documentElement.setAttribute('data-theme', saved);
   updateThemeIcon(saved);
 }
 function toggleTheme() {
   const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
   document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('wavely_theme', next);
+  localStorage.setItem('sonicra_theme', next);
   updateThemeIcon(next);
 }
 function updateThemeIcon(theme) {
@@ -285,21 +285,51 @@ function playTrack(track, queue = [], queueIndex = 0) {
   updatePlayerUI(track);
   highlightPlayingRow(String(videoId));
 
+  const doPlay = () => {
+    ytPlayer.loadVideoById(videoId);
+    ytPlayer.setVolume(parseInt(document.getElementById('volume-slider').value));
+  };
+
   if (!ytReady || !ytPlayer) {
-    // Wait for player to be ready then play
     const waitAndPlay = setInterval(() => {
       if (ytReady && ytPlayer) {
         clearInterval(waitAndPlay);
-        ytPlayer.loadVideoById(videoId);
-        ytPlayer.setVolume(parseInt(document.getElementById('volume-slider').value));
+        doPlay();
       }
     }, 200);
     setTimeout(() => clearInterval(waitAndPlay), 10000);
     return;
   }
 
-  ytPlayer.loadVideoById(videoId);
-  ytPlayer.setVolume(parseInt(document.getElementById('volume-slider').value));
+  // On mobile, autoplay is blocked — cue video and show tap overlay
+  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  if (isMobile) {
+    ytPlayer.cueVideoById(videoId);
+    showTapToPlay(doPlay);
+  } else {
+    doPlay();
+  }
+}
+
+function showTapToPlay(onTap) {
+  // Remove existing overlay
+  const existing = document.getElementById('tap-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'tap-overlay';
+  overlay.className = 'tap-overlay';
+  overlay.innerHTML = `
+    <div class="tap-overlay-inner">
+      <div class="tap-play-btn">▶</div>
+      <p>Tap to play</p>
+    </div>
+  `;
+  overlay.onclick = () => {
+    overlay.remove();
+    onTap();
+  };
+  document.body.appendChild(overlay);
 }
 
 function updatePlayerUI(track) {
@@ -324,7 +354,16 @@ function highlightPlayingRow(trackId) {
 }
 
 function togglePlayPause() {
-  if (!currentTrack || !ytReady) return;
+  if (!currentTrack) return;
+  if (!ytReady || !ytPlayer) return;
+
+  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  if (isMobile && ytPlayer.getPlayerState() === YT.PlayerState.CUED) {
+    // First play on mobile needs direct user gesture
+    ytPlayer.playVideo();
+    return;
+  }
+
   if (isPlaying) ytPlayer.pauseVideo();
   else ytPlayer.playVideo();
 }
@@ -579,6 +618,56 @@ async function addTrackToPlaylist(playlistId, playlistName) {
   if (!error) showToast(`Added to "${playlistName}"`);
   else if (error.code === '23505') showToast('Already in this playlist');
   else showToast('Failed to add');
+}
+
+// ─── Tap to Play (mobile fix) ───────────────────
+function showTapToPlay() {
+  // Remove existing overlay
+  const existing = document.getElementById('tap-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'tap-overlay';
+  overlay.innerHTML = `
+    <div class="tap-play-btn">
+      <span>▶</span>
+      <p>Tap to play</p>
+    </div>
+  `;
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(4px);
+  `;
+  overlay.querySelector('.tap-play-btn').style.cssText = `
+    background: var(--accent);
+    color: #000;
+    border-radius: 50%;
+    width: 80px;
+    height: 80px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.8rem;
+    cursor: pointer;
+    box-shadow: 0 0 40px rgba(30,215,96,0.5);
+  `;
+  overlay.querySelector('p').style.cssText = `
+    font-size: 0.6rem;
+    margin-top: 4px;
+    font-family: var(--font-body);
+  `;
+  overlay.onclick = () => {
+    if (ytPlayer) ytPlayer.playVideo();
+    overlay.remove();
+  };
+  document.body.appendChild(overlay);
 }
 
 // ─── Helpers ─────────────────────────────────────

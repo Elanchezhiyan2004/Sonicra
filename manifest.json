@@ -1,0 +1,18 @@
+{
+  "name": "Sonicra",
+  "short_name": "Sonicra",
+  "description": "Your music, no ads",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d0d0d",
+  "theme_color": "#1ed760",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
