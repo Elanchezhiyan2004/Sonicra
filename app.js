@@ -117,6 +117,14 @@ function initSupabase() {
   } catch (e) { return null; }
 }
 
+// ─── Mobile Nav ─────────────────────────────────
+function showViewMobile(name) {
+  showView(name);
+  document.querySelectorAll('.bnav-btn').forEach(b => b.classList.remove('active'));
+  const activeBtn = document.querySelector(`[data-mv="${name}"]`);
+  if (activeBtn) activeBtn.classList.add('active');
+}
+
 // ─── Theme ──────────────────────────────────────
 function initTheme() {
   const saved = localStorage.getItem('sonicra_theme') || 'dark';
@@ -128,6 +136,8 @@ function toggleTheme() {
   document.documentElement.setAttribute('data-theme', next);
   localStorage.setItem('sonicra_theme', next);
   updateThemeIcon(next);
+  const mobileIcon = document.getElementById('theme-icon-mobile');
+  if (mobileIcon) mobileIcon.textContent = next === 'dark' ? '☀️' : '🌙';
 }
 function updateThemeIcon(theme) {
   const icon = document.getElementById('theme-icon');
