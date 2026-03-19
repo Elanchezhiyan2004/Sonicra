@@ -35,7 +35,7 @@ Sonicra is a personal music streaming web app — full song playback via YouTube
 | Layer | Technology |
 |---|---|
 | Frontend | Vanilla HTML + CSS + JavaScript |
-| Music | YouTube Data API v3 + IFrame Player API |
+| Music | YouTube Data API v3 |
 | Backend | Supabase (Auth + PostgreSQL) |
 | Hosting | Netlify |
 | PWA | Web App Manifest + Service Worker |
