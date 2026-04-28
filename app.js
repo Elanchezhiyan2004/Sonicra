@@ -23,6 +23,22 @@ let currentPlaylistId = null;
 let searchDebounceTimer = null;
 let currentKeyIndex = 0;
 
+// ─── FIX 2: Mobile audio unlock ─────────────────
+// Track whether the user has ever tapped to unlock audio on mobile.
+// Once unlocked, autoplay flows without interruption — no more per-song tap.
+let audioUnlocked = false;
+
+// ─── FIX 3: Track where the current song came from ──
+// 'search'  → song was picked from search results → autoplay must use genre, NOT search queue
+// 'related' → song is already in a genre-based stream → keep using related
+// 'playlist'/'liked'/'queue' → play next in that queue normally
+let playSource = 'related'; // default
+
+// ─── Global played history — prevents ANY repeat in autoplay ──
+// Stores videoIds of every song played this session in the related/search stream.
+// Reset only when user manually picks a new song from search.
+let playedHistory = new Set();
+
 function getApiKey() {
   const keys = CONFIG.YT_API_KEYS;
   if (!keys || keys.length === 0) return null;
@@ -69,7 +85,7 @@ function onPlayerStateChange(event) {
     if (sleepAfterSong) {
       sleepAfterSong = false;
       showToast('Song ended — sleep timer stopped music 😴');
-      return; // don't play next
+      return;
     }
     playNextInQueue();
   } else if (event.data === S.BUFFERING) {
@@ -101,7 +117,6 @@ window.addEventListener('DOMContentLoaded', async () => {
   db = initSupabase();
   if (!db) { showView('home'); return; }
 
-  // Check session
   const { data: { session } } = await db.auth.getSession();
   if (session) {
     currentUser = session.user;
@@ -110,7 +125,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     showAuthScreen();
   }
 
-  // Listen for auth changes
   db.auth.onAuthStateChange(async (event, session) => {
     if (event === 'SIGNED_IN' && session) {
       currentUser = session.user;
@@ -170,6 +184,37 @@ async function handleAuth(mode) {
   }
 
   if (result.error) { errEl.style.color = '#ef4444'; errEl.textContent = result.error.message; }
+}
+
+// ─── FIX 1: Google Sign-In ───────────────────────
+// Uses Supabase's built-in OAuth with Google provider.
+// The Google Identity Services SDK in index.html handles the button UI,
+// but we trigger Supabase OAuth on click for full session management.
+async function handleGoogleSignIn() {
+  if (!db) {
+    showToast('Auth not configured');
+    return;
+  }
+  const errEl = document.getElementById('auth-error');
+  errEl.textContent = '';
+
+  const { error } = await db.auth.signInWithOAuth({
+    provider: 'google',
+    options: {
+      redirectTo: window.location.origin,
+      queryParams: {
+        access_type: 'offline',
+        prompt: 'consent',
+      },
+    },
+  });
+
+  if (error) {
+    errEl.style.color = '#ef4444';
+    errEl.textContent = error.message;
+  }
+  // On success Supabase redirects to Google, then back to app.
+  // onAuthStateChange fires with SIGNED_IN and calls onLoggedIn() automatically.
 }
 
 async function logout() {
@@ -232,14 +277,12 @@ function showContextMenu(event, track) {
   const menu = document.getElementById('context-menu');
   menu.classList.remove('hidden');
 
-  // Position menu
   const x = event.clientX || (event.touches?.[0]?.clientX) || 0;
   const y = event.clientY || (event.touches?.[0]?.clientY) || 0;
   const mw = 220, mh = 280;
   menu.style.left = `${Math.min(x, window.innerWidth - mw - 10)}px`;
   menu.style.top = `${Math.min(y, window.innerHeight - mh - 10)}px`;
 
-  // Update liked state in menu
   const trackId = String(track.videoId || track.id || track.track_id);
   const likeItem = document.getElementById('ctx-like');
   if (likeItem) likeItem.textContent = likedSongIds.has(trackId) ? '💔 Unlike' : '♥ Like';
@@ -263,7 +306,7 @@ function ctxAddToQueue() {
 }
 function ctxAddToPlaylist() {
   if (!contextMenuTrack) return;
-  const track = { ...contextMenuTrack }; // snapshot to avoid reference issues
+  const track = { ...contextMenuTrack };
   hideContextMenu();
   openAddToPlaylist(track);
 }
@@ -281,7 +324,6 @@ function closeSleepTimer() {
 function setSleepTimer(minutes) {
   if (sleepTimer) clearTimeout(sleepTimer);
   if (minutes === 0) {
-    // End of current song — set flag checked in onPlayerStateChange
     sleepAfterSong = true;
     showToast('Will stop after current song ends 🎵');
     closeSleepTimer();
@@ -317,25 +359,24 @@ async function doSearch(query, targetId = 'home-results', retryCount = 0) {
 
   const apiKey = getApiKey();
   if (!apiKey) {
-    container.innerHTML = `<div class="empty-state"><div class="empty-icon">🔑</div><p>No API key configured in config.js</p></div>`;
+    container.innerHTML = `<div class="empty-state"><div class="empty-icon">🔑</div><p>No API key configured</p></div>`;
     return;
   }
 
   if (retryCount === 0) container.innerHTML = `<div class="empty-state"><p>Searching...</p></div>`;
 
   try {
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&q=${encodeURIComponent(query)}&maxResults=20&key=${apiKey}&videoEmbeddable=true`;
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&order=relevance&q=${encodeURIComponent(query)}&maxResults=20&key=${apiKey}&videoEmbeddable=true`;
     const res = await fetch(url);
     const data = await res.json();
 
-    // Quota exceeded — try next key
     if (data.error?.code === 403 || data.error?.errors?.[0]?.reason === 'quotaExceeded' || data.error?.errors?.[0]?.reason === 'dailyLimitExceeded') {
       console.warn(`Key ${currentKeyIndex + 1} quota exceeded`);
       if (rotateApiKey() && retryCount < CONFIG.YT_API_KEYS.length - 1) {
         showToast(`Switching to backup API key...`);
         return doSearch(query, targetId, retryCount + 1);
       } else {
-        container.innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div><p>All API keys have hit their daily quota.<br>Quota resets at midnight US Pacific Time.<br><br>To get more searches, add more API keys in config.js</p></div>`;
+        container.innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div><p>All API keys hit daily quota.<br>Quota resets at midnight US Pacific Time.</p></div>`;
         return;
       }
     }
@@ -343,14 +384,33 @@ async function doSearch(query, targetId = 'home-results', retryCount = 0) {
     if (data.error) { container.innerHTML = `<div class="empty-state"><p>⚠️ ${data.error.message}</p></div>`; return; }
     if (!data.items?.length) { container.innerHTML = `<div class="empty-state"><div class="empty-icon">🎵</div><p>No results for "<strong>${query}</strong>"</p></div>`; return; }
 
-    const tracks = data.items.map(item => ({
-      id: item.id.videoId, videoId: item.id.videoId,
-      name: cleanTitle(item.snippet.title),
-      artist: item.snippet.channelTitle.replace(/ - Topic| VEVO/gi, '').trim(),
-      thumbnail: item.snippet.thumbnails?.medium?.url || '',
-    }));
+    const JUNK = /\breact(ion)?\b|unboxing|podcast|news bulletin|daily news|cooking|vlog|gameplay/i;
 
+    let tracks = data.items
+      .map(item => ({
+        id: item.id.videoId,
+        videoId: item.id.videoId,
+        name: cleanTitle(item.snippet.title),
+        artist: item.snippet.channelTitle.replace(/ - Topic| VEVO| Official/gi, '').trim(),
+        thumbnail: item.snippet.thumbnails?.medium?.url || '',
+        rawTitle: item.snippet.title,
+        isOfficial: /official/i.test(item.snippet.title) || /VEVO|- Topic/i.test(item.snippet.channelTitle),
+      }))
+      .filter(t => !JUNK.test(t.rawTitle));
+
+    tracks.sort((a, b) => (b.isOfficial ? 1 : 0) - (a.isOfficial ? 1 : 0));
+
+    if (!tracks.length) {
+      container.innerHTML = `<div class="empty-state"><div class="empty-icon">🎵</div><p>No results for "<strong>${query}</strong>"</p></div>`;
+      return;
+    }
+
+    // ── FIX 3: Store search results separately ──
+    // When a user picks a song from search, we mark source as 'search'.
+    // The search result list is stored so UI renders correctly,
+    // but playNextInQueue will IGNORE this list and use genre-based related instead.
     currentQueue = [...tracks];
+
     container.innerHTML = '';
     if (targetId === 'home-results') {
       container.className = 'track-grid';
@@ -364,12 +424,151 @@ async function doSearch(query, targetId = 'home-results', retryCount = 0) {
 
 async function fetchRelatedTracks(track) {
   try {
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&q=${encodeURIComponent(track.artist)}&maxResults=10&key=${getApiKey()}&videoEmbeddable=true`;
-    const res = await fetch(url);
-    const data = await res.json();
-    return (data.items || [])
-      .map(item => ({ id: item.id.videoId, videoId: item.id.videoId, name: cleanTitle(item.snippet.title), artist: item.snippet.channelTitle.replace(/ - Topic| VEVO/gi, '').trim(), thumbnail: item.snippet.thumbnails?.medium?.url || '' }))
-      .filter(t => t.videoId !== track.videoId);
+    const artist = track.artist || '';
+    const title = track.name || track.rawTitle || '';
+    const combined = `${title} ${artist}`.toLowerCase();
+
+    const langPatterns = {
+      'Tamil': {
+        channels: /think music|sony music south|lahari|ayngaran|pyramid|saregama tamil|sun music|kalaignar|vikatan|ags|lyca|red giant|white hill tamil/i,
+        keywords: /tamil|தமிழ்|kollywood|anirudh|harris jayaraj|yuvan shankar|ar rahman tamil|sid sriram|vijay antony|gv prakash|imman|santhosh narayanan|devi sri prasad tamil|ilaiyaraaja/i,
+      },
+      'Telugu': {
+        channels: /aditya music|lahari telugu|sony music telugu|saregama telugu|annapurna|suresh productions|ra music|telugu filmnagar/i,
+        keywords: /telugu|tollywood|dsp|thaman|mickey j meyer|ss thaman|mani sharma|chakri|ramajogayya|manisharma/i,
+      },
+      'Hindi': {
+        channels: /t-series|zee music|sony music india|saregama|tips music|eros|yash raj|dharma|speed records/i,
+        keywords: /hindi|bollywood|arijit singh|atif aslam|shreya ghoshal|sonu nigam|kumar sanu|lata mangeshkar|kishore kumar|udit narayan|armaan malik|jubin nautiyal/i,
+      },
+      'Malayalam': {
+        channels: /kappa tv|official jiosavan|universal music kerala|saregama malayalam|jos films/i,
+        keywords: /malayalam|mollywood|m jayachandran|ouseppachan|raveendran|vidyasagar|berny|alphons joseph/i,
+      },
+      'Kannada': {
+        channels: /anand audio|akash audio|saregama kannada|lahari kannada/i,
+        keywords: /kannada|sandalwood|ravi basrur|arjun janya|v harikrishna|mano murthy/i,
+      },
+    };
+
+    let detectedLang = '';
+    for (const [lang, { channels, keywords }] of Object.entries(langPatterns)) {
+      if (channels.test(artist) || keywords.test(combined)) {
+        detectedLang = lang;
+        break;
+      }
+    }
+
+    const eraMap = [
+      { label: '90s', regex: /\b(90s|199\d)\b/i },
+      { label: '2000s', regex: /\b(2000s|200\d)\b/i },
+      { label: '2010s', regex: /\b(2010s|201\d)\b/i },
+      { label: '2020s', regex: /\b(202\d)\b/i },
+    ];
+    let era = '';
+    for (const { label, regex } of eraMap) {
+      if (regex.test(combined)) { era = label; break; }
+    }
+
+    const genreMap = [
+      { label: 'melody love songs', regex: /melody|soft|romantic|love|kadhal|pyaar|ishq/i },
+      { label: 'mass dance', regex: /mass|kuthu|dance|beat|party|item/i },
+      { label: 'sad emotional', regex: /sad|emotional|breakup|dard|dukh/i },
+      { label: 'folk', regex: /folk|gaana|nattu|desi|village/i },
+    ];
+    let genre = '';
+    for (const { label, regex } of genreMap) {
+      if (regex.test(combined)) { genre = label; break; }
+    }
+
+    const queries = [];
+    queries.push(`${artist} ${detectedLang} songs`.trim());
+    let q2 = detectedLang;
+    if (genre) q2 += ` ${genre}`;
+    if (era) q2 += ` ${era}`;
+    q2 += ' songs';
+    queries.push(q2.trim());
+    let q3 = detectedLang;
+    if (era) q3 += ` ${era}`;
+    else q3 += ' latest';
+    q3 += ' hit songs';
+    queries.push(q3.trim());
+
+    console.log('Related queries:', queries);
+
+    const JUNK = /\breact(ion)?\b|unboxing|podcast|news bulletin|daily news|cooking|vlog|gameplay/i;
+
+    const results = await Promise.all(
+      queries.map(async (q) => {
+        try {
+          const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&order=relevance&q=${encodeURIComponent(q)}&maxResults=10&key=${getApiKey()}&videoEmbeddable=true`;
+          const res = await fetch(url);
+          const data = await res.json();
+          if (!data.items) return [];
+          return data.items.map(item => ({
+            id: item.id.videoId,
+            videoId: item.id.videoId,
+            name: cleanTitle(item.snippet.title),
+            artist: item.snippet.channelTitle.replace(/ - Topic| VEVO| Official/gi, '').trim(),
+            thumbnail: item.snippet.thumbnails?.medium?.url || '',
+            rawTitle: item.snippet.title,
+          })).filter(t => !JUNK.test(t.rawTitle));
+        } catch { return []; }
+      })
+    );
+
+    // ── Merge + deduplicate against GLOBAL playedHistory (no repeats across session) ──
+    const merged = [];
+    for (const batch of results) {
+      for (const t of batch) {
+        // Skip if already played this session OR duplicate in this batch
+        if (!playedHistory.has(t.videoId)) {
+          merged.push(t);
+        }
+        if (merged.length >= 20) break;
+      }
+      if (merged.length >= 20) break;
+    }
+
+    // ── Fallback: if genre queries returned nothing new, search by language randomly ──
+    // This handles the case where the genre pool is exhausted but session should continue.
+    if (merged.length === 0 && detectedLang) {
+      try {
+        // Use a random page offset so we don't get the same songs again
+        const randomOffset = Math.floor(Math.random() * 5) + 1;
+        const fallbackQueries = [
+          `${detectedLang} hit songs`,
+          `${detectedLang} songs ${new Date().getFullYear()}`,
+          `best ${detectedLang} songs`,
+          `${detectedLang} melody songs`,
+          `${detectedLang} songs playlist`,
+        ];
+        const fq = fallbackQueries[randomOffset % fallbackQueries.length];
+        const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&order=date&q=${encodeURIComponent(fq)}&maxResults=20&key=${getApiKey()}&videoEmbeddable=true`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.items) {
+          for (const item of data.items) {
+            const t = {
+              id: item.id.videoId,
+              videoId: item.id.videoId,
+              name: cleanTitle(item.snippet.title),
+              artist: item.snippet.channelTitle.replace(/ - Topic| VEVO| Official/gi, '').trim(),
+              thumbnail: item.snippet.thumbnails?.medium?.url || '',
+              rawTitle: item.snippet.title,
+            };
+            const JUNK = /\breact(ion)?\b|unboxing|podcast|news bulletin|daily news|cooking|vlog|gameplay/i;
+            if (!playedHistory.has(t.videoId) && !JUNK.test(t.rawTitle)) {
+              merged.push(t);
+            }
+            if (merged.length >= 15) break;
+          }
+        }
+      } catch { /* fallback failed silently */ }
+    }
+
+    return merged;
+
   } catch { return []; }
 }
 
@@ -389,8 +588,9 @@ function createTrackCard(track, index) {
     <div class="track-card-artist">${track.artist}</div>
     <button class="track-card-menu" title="More options">⋮</button>
   `;
-  div.onclick = () => playTrack(track, currentQueue, index);
-  div.querySelector('.track-card-play').onclick = (e) => { e.stopPropagation(); playTrack(track, currentQueue, index); };
+  // FIX 3: mark source as 'search' when user picks from search results
+  div.onclick = () => playTrackFromSearch(track, currentQueue, index);
+  div.querySelector('.track-card-play').onclick = (e) => { e.stopPropagation(); playTrackFromSearch(track, currentQueue, index); };
   div.querySelector('.track-card-menu').onclick = (e) => { e.stopPropagation(); showContextMenu(e, track); };
   return div;
 }
@@ -419,7 +619,13 @@ function createTrackRow(track, index, queue = [], showRemove = false, removeCall
   div.onclick = (e) => {
     if (selectMode) { toggleSelectTrack(trackId, track, div); return; }
     if (e.target.closest('.row-menu-btn') || e.target.closest('.remove-btn')) return;
-    playTrack(track, queue, index);
+    // FIX 3: if this row is inside a search result container, mark as search source
+    const isSearchResult = div.closest('#search-results') || div.closest('#home-results');
+    if (isSearchResult) {
+      playTrackFromSearch(track, queue, index);
+    } else {
+      playTrack(track, queue, index);
+    }
   };
 
   div.querySelector('.row-menu-btn').onclick = (e) => { e.stopPropagation(); showContextMenu(e, track); };
@@ -429,7 +635,16 @@ function createTrackRow(track, index, queue = [], showRemove = false, removeCall
   return div;
 }
 
-// ─── Selection Mode (for adding songs to playlist) ─
+// ─── FIX 3: Wrapper for search-originated plays ──
+// Resets the played history so the new stream starts fresh with zero repeats.
+function playTrackFromSearch(track, queue, index) {
+  playSource = 'search';
+  playedHistory = new Set(); // fresh session — wipe repeat memory
+  playedHistory.add(String(track.videoId || track.id));
+  playTrack(track, queue, index);
+}
+
+// ─── Selection Mode ──────────────────────────────
 function toggleSelectMode() {
   selectMode = !selectMode;
   selectedTracks.clear();
@@ -437,7 +652,6 @@ function toggleSelectMode() {
   const addBtn = document.getElementById('add-selected-btn');
   if (btn) btn.classList.toggle('active', selectMode);
   if (addBtn) addBtn.style.display = selectMode ? 'flex' : 'none';
-  // Re-render playlist tracks
   const pl = playlists.find(p => p.id === currentPlaylistId);
   if (pl) openPlaylistDetail(pl);
 }
@@ -449,7 +663,6 @@ function toggleSelectTrack(trackId, track, rowEl) {
     rowEl.querySelector('.track-checkbox').checked = false;
   } else {
     selectedTracks.add(trackId);
-    selectedTracks.set ? null : null; // Set is fine
     rowEl.classList.add('selected');
     rowEl.querySelector('.track-checkbox').checked = true;
   }
@@ -463,8 +676,6 @@ function addSelectedToPlaylist() {
 }
 
 function openAddToPlaylistBulk(trackIds) {
-  // For bulk add, we'll add all selected songs (they are already in current playlist view)
-  // This is for adding songs from search to a playlist
   showToast(`${trackIds.length} songs selected — feature for search view`);
 }
 
@@ -513,14 +724,25 @@ function playTrack(track, queue = [], queueIndex = 0) {
     return;
   }
 
-  if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+  if (isMobile && !audioUnlocked) {
+    // ── FIX 2: First-ever tap on mobile ──
+    // Show "Tap to play" only ONCE to unlock the audio context.
+    // After this, audioUnlocked = true and all future songs play silently.
     ytPlayer.cueVideoById(videoId);
-    showTapToPlay(doPlay);
-  } else { doPlay(); }
+    showTapToPlay(() => {
+      audioUnlocked = true;
+      doPlay();
+    });
+  } else {
+    // Audio already unlocked (or desktop) — play directly, no overlay.
+    doPlay();
+  }
 }
 
 async function playNextInQueue() {
-  // Manual queue first
+  // Manual queue always goes first
   if (manualQueue.length > 0) {
     const next = manualQueue.shift();
     updateQueueBadge(); renderQueuePanel();
@@ -528,12 +750,10 @@ async function playNextInQueue() {
     return;
   }
 
-  // Shuffle — play each song once before repeating
+  // Shuffle mode
   if (isShuffle && currentQueue.length > 1) {
-    // Filter out already played
     let unplayed = currentQueue.filter((_, i) => !playedInShuffle.has(i));
     if (unplayed.length === 0) {
-      // All played — reset and start again
       playedInShuffle.clear();
       unplayed = [...currentQueue];
       showToast('🔀 Replaying shuffled playlist');
@@ -547,18 +767,32 @@ async function playNextInQueue() {
     return;
   }
 
-  // Next in queue
-  if (currentQueue.length > 0 && currentQueueIndex < currentQueue.length - 1) {
-    const nextIndex = currentQueueIndex + 1;
-    playTrack(currentQueue[nextIndex], currentQueue, nextIndex);
+  // ── FIX 3: Genre-based autoplay ──
+  // If song came from search OR we're already in a genre stream,
+  // always fetch related genre tracks — never continue through search results.
+  if (currentTrack && (playSource === 'search' || playSource === 'related')) {
+    showToast('Loading similar songs...');
+    const related = await fetchRelatedTracks(currentTrack);
+    if (related.length > 0) {
+      playSource = 'related';
+      // Pick the first song from the fresh batch and mark it as played
+      // so it won't repeat in the NEXT fetch cycle
+      const nextSong = related[0];
+      playedHistory.add(String(nextSong.videoId || nextSong.id));
+      currentQueue = related;
+      currentQueueIndex = 0;
+      playTrack(nextSong, related, 0);
+      return;
+    }
+    // If both genre fetch and fallback failed (very unlikely), show toast and stop
+    showToast('No more similar songs found');
     return;
   }
 
-  // Auto-fetch related
-  if (currentTrack) {
-    showToast('Loading related songs...');
-    const related = await fetchRelatedTracks(currentTrack);
-    if (related.length > 0) { currentQueue = related; currentQueueIndex = 0; playTrack(related[0], related, 0); }
+  // Fallback: play next in existing queue (playlist/liked songs context)
+  if (currentQueue.length > 0 && currentQueueIndex < currentQueue.length - 1) {
+    const nextIndex = currentQueueIndex + 1;
+    playTrack(currentQueue[nextIndex], currentQueue, nextIndex);
   }
 }
 
@@ -603,12 +837,14 @@ function updatePlayerUI(track) {
 function highlightPlayingRow(trackId) {
   document.querySelectorAll('.track-row').forEach(r => r.classList.toggle('playing', r.dataset.trackId === trackId));
 }
+
+// ── FIX 2: Tap overlay — shown ONLY on first play on mobile ──
 function showTapToPlay(onTap) {
   document.getElementById('tap-overlay')?.remove();
   const overlay = document.createElement('div');
   overlay.id = 'tap-overlay';
   overlay.className = 'tap-overlay';
-  overlay.innerHTML = `<div class="tap-overlay-inner"><div class="tap-play-btn">▶</div><p>Tap to play</p></div>`;
+  overlay.innerHTML = `<div class="tap-overlay-inner"><div class="tap-play-btn">▶</div><p>Tap to start</p></div>`;
   overlay.onclick = () => { overlay.remove(); onTap(); };
   document.body.appendChild(overlay);
 }
@@ -658,7 +894,11 @@ async function renderLikedSongs() {
   container.innerHTML = '';
   songs.forEach((s, i) => container.appendChild(createTrackRow({ id: s.track_id, videoId: s.track_id, name: s.track_name, artist: s.artist_name, thumbnail: s.album_art }, i, queue)));
 }
-function playAllLiked() { document.querySelector('#liked-list .track-row')?.click(); }
+function playAllLiked() {
+  // Liked songs use normal queue (not search source)
+  playSource = 'playlist';
+  document.querySelector('#liked-list .track-row')?.click();
+}
 
 // ─── Playlists ───────────────────────────────────
 async function loadPlaylists() {
@@ -731,13 +971,15 @@ async function openPlaylistDetail(pl) {
     const track = { id: t.track_id, videoId: t.track_id, name: t.track_name, artist: t.artist_name, thumbnail: t.album_art };
     container.appendChild(createTrackRow(track, i, queue, true, () => removeFromPlaylist(pl.id, t.track_id)));
   });
-  // Update select button
   const btn = document.getElementById('select-mode-btn');
   if (btn) { btn.classList.remove('active'); }
   document.getElementById('add-selected-btn').style.display = 'none';
 }
 
-function playAllPlaylist() { document.querySelector('#playlist-track-list .track-row')?.click(); }
+function playAllPlaylist() {
+  playSource = 'playlist';
+  document.querySelector('#playlist-track-list .track-row')?.click();
+}
 
 function shufflePlaylist() {
   const rows = [...document.querySelectorAll('#playlist-track-list .track-row')];
@@ -746,6 +988,7 @@ function shufflePlaylist() {
   for (let i = queue.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [queue[i], queue[j]] = [queue[j], queue[i]]; }
   playedInShuffle.clear();
   isShuffle = true;
+  playSource = 'playlist';
   currentQueue = queue;
   currentQueueIndex = 0;
   playedInShuffle.add(0);
@@ -762,7 +1005,6 @@ async function removeFromPlaylist(playlistId, trackId) {
 
 // ─── Add to Playlist ─────────────────────────────
 function openAddToPlaylist(track) {
-  // track must be explicitly passed — never fall back to currentTrack
   if (!track) { showToast('Select a track first'); return; }
   if (!currentUser) { showToast('Log in to use playlists'); return; }
 
@@ -770,7 +1012,6 @@ function openAddToPlaylist(track) {
   const list = document.getElementById('playlist-modal-list');
   list.innerHTML = '';
 
-  // Store the SPECIFIC track in the modal — not currentTrack
   const trackData = {
     id: track.id || track.videoId || track.track_id,
     videoId: track.videoId || track.id || track.track_id,
@@ -812,7 +1053,6 @@ async function addTrackToPlaylist(playlistId, playlistName) {
 
   const trackId = String(track.videoId);
 
-  // Check if already in playlist before inserting
   const { data: existing } = await db
     .from('playlist_tracks')
     .select('id')
